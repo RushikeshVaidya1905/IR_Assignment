@@ -50,3 +50,40 @@ class VariableByteEncoder:
         for i in range(1, len(gaps)):
             decoded.append(decoded[-1] + gaps[i])
         return decoded
+    @staticmethod
+    def encode_list(numbers: list[int]) -> bytes:
+        """VB-encodes a list of integers into one byte string."""
+        out = bytearray()
+        for n in numbers:
+            out.extend(VariableByteEncoder.encode_number(n))
+        return bytes(out)
+
+
+class GammaEncoder:
+    """Elias gamma codes (IIR 5.3.2). Only defined for n >= 1, so callers encode gaps (which are >= 1)
+    or add 1 to values that may be 0 (e.g. the first position)."""
+    @staticmethod
+    def encode_number(n: int) -> str:
+        """Returns the gamma code of n as a bit string: unary(length) + offset."""
+        offset = bin(n)[3:]  # binary of n without the leading 1
+        return '1' * len(offset) + '0' + offset
+
+    @staticmethod
+    def encode_list(numbers: list[int]) -> bytes:
+        bits = ''.join(GammaEncoder.encode_number(n) for n in numbers)
+        bits += '0' * (-len(bits) % 8)  # pad to a whole byte
+        return int(bits, 2).to_bytes(len(bits) // 8, 'big') if bits else b''
+
+    @staticmethod
+    def decode(stream: bytes, count: int) -> list[int]:
+        bits = ''.join(f'{b:08b}' for b in stream)
+        numbers, i = [], 0
+        while len(numbers) < count:
+            length = 0
+            while bits[i] == '1':
+                length += 1
+                i += 1
+            i += 1  # skip the 0 that ends the unary part
+            numbers.append(int('1' + bits[i:i + length], 2))
+            i += length
+        return numbers

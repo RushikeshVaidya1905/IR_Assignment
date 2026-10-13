@@ -1,93 +1,127 @@
 import os
 import json
-import psutil
-from collections import defaultdict
-from src.indexing.compress import VariableByteEncoder
+import math
+import heapq
+from collections import defaultdict, Counter
+
+# Block files are text files with one line per term, sorted by term:  term \t {"doc_id": [positions], ...}
+# Both SPIMI and BSBI write this format, so the same external k-way merge is used for both.
+
 
 class SPIMIIndexer:
-    def __init__(self, output_dir: str, memory_limit_mb: float = 20.0):
+    """Single-pass in-memory indexing (IIR 4.3): term -> {doc_id: [positions]} is built directly in memory.
+    Dummy memory constraint: at most `memory_limit` postings (token positions) may be held in memory;
+    when it is reached the block is sorted by term and written to disk."""
+    def __init__(self, output_dir: str, memory_limit: int = 100_000, block_prefix: str = "block"):
         self.output_dir = output_dir
-        self.memory_limit_mb = memory_limit_mb
+        self.memory_limit = memory_limit
+        self.block_prefix = block_prefix
         self.dictionary = defaultdict(lambda: defaultdict(list))
+        self.in_memory = 0
         self.block_number = 0
+        self.block_files = []
+        self.bytes_written = 0
         os.makedirs(output_dir, exist_ok=True)
-        
+
     def is_memory_full(self) -> bool:
-        process = psutil.Process(os.getpid())
-        mem_mb = process.memory_info().rss / (1024 * 1024)
-        return mem_mb > self.memory_limit_mb
-        
+        return self.in_memory >= self.memory_limit
+
     def add_token(self, term: str, doc_id: int, position: int):
-        self.dictionary[term][str(doc_id)].append(position)
-        
+        self.dictionary[term][doc_id].append(position)
+        self.in_memory += 1
+
+    def _sorted_block(self):
+        for term in sorted(self.dictionary.keys()):
+            yield term, self.dictionary[term]
+
+    def _clear(self):
+        self.dictionary.clear()
+
     def flush_to_disk(self):
-        if not self.dictionary:
+        if self.in_memory == 0:
             return
-            
-        block_file = os.path.join(self.output_dir, f"block_{self.block_number}.json")
-        sorted_terms = sorted(self.dictionary.keys())
-        block_data = {term: self.dictionary[term] for term in sorted_terms}
-            
+        block_file = os.path.join(self.output_dir, f"{self.block_prefix}_{self.block_number}.txt")
         with open(block_file, 'w') as f:
-            json.dump(block_data, f)
-            
-        print(f"-> Flushed {os.path.basename(block_file)} ({len(sorted_terms)} terms).")
+            for term, docs in self._sorted_block():
+                f.write(term + "\t" + json.dumps(docs) + "\n")
+        self.bytes_written += os.path.getsize(block_file)
+        self.block_files.append(block_file)
         self.block_number += 1
-        self.dictionary.clear() 
+        self.in_memory = 0
+        self._clear()
 
-    def get_current_memory_usage(self) -> float:
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / (1024 * 1024)
 
-    def merge_blocks(self, final_dict_name="dictionary.json", final_postings_name="postings.bin"):
-        """Merges partial blocks, applies VB compression, and writes the final index."""
-        block_files = [os.path.join(self.output_dir, f"block_{i}.json") for i in range(self.block_number)]
-        merged_dict = defaultdict(lambda: defaultdict(list))
-        
-        # Load and combine all partial blocks
-        for file_path in block_files:
-            if not os.path.exists(file_path):
-                continue
-            with open(file_path, 'r') as f:
-                block_data = json.load(f)
-                for term, docs in block_data.items():
-                    for doc_id, positions in docs.items():
-                        merged_dict[term][doc_id].extend(positions)
-                        merged_dict[term][doc_id].sort()
+class BSBIIndexer(SPIMIIndexer):
+    """Blocked sort-based indexing (IIR 4.2), for comparison with SPIMI: terms are mapped to termIDs
+    (a global term -> termID table kept in memory), (termID, docID, position) triples are collected,
+    and each full block is sorted by termID before being written."""
+    def __init__(self, output_dir: str, memory_limit: int = 100_000, block_prefix: str = "block"):
+        super().__init__(output_dir, memory_limit, block_prefix)
+        self.term_ids = {}
+        self.terms = []
+        self.triples = []
 
-        final_dictionary = {}
-        postings_file_path = os.path.join(self.output_dir, final_postings_name)
-        
-        with open(postings_file_path, 'wb') as f_out:
-            for term in sorted(merged_dict.keys()):
-                # Sort doc IDs numerically
-                doc_ids = sorted([int(d) for d in merged_dict[term].keys()])
-                
-                # Gap encode and compress
-                gapped_docs = VariableByteEncoder.gap_encode(doc_ids)
-                encoded_bytes = bytearray()
-                for gap in gapped_docs:
-                    encoded_bytes.extend(VariableByteEncoder.encode_number(gap))
-                
-                # Write to binary file and record offset/size
-                offset = f_out.tell()
-                f_out.write(encoded_bytes)
-                byte_size = f_out.tell() - offset
-                
-                # Store metadata, term frequencies (for vector space scoring), and positions (for phrase queries)
-                final_dictionary[term] = {
-                    "df": len(doc_ids),
-                    "offset": offset,
-                    "byte_size": byte_size,
-                    "tf": {d: len(merged_dict[term][str(d)]) for d in doc_ids},
-                    "positions": {d: merged_dict[term][str(d)] for d in doc_ids}
-                }
+    def add_token(self, term: str, doc_id: int, position: int):
+        term_id = self.term_ids.get(term)
+        if term_id is None:
+            term_id = len(self.terms)
+            self.term_ids[term] = term_id
+            self.terms.append(term)
+        self.triples.append((term_id, doc_id, position))
+        self.in_memory += 1
 
-        dict_path = os.path.join(self.output_dir, final_dict_name)
-        with open(dict_path, 'w') as f:
-            json.dump(final_dictionary, f)
-            
-        # Clean up temporary JSON blocks
-        for file_path in block_files:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+    def _sorted_block(self):
+        self.triples.sort()
+        groups = {}
+        for term_id, doc_id, pos in self.triples:
+            groups.setdefault(term_id, {}).setdefault(doc_id, []).append(pos)
+        # write in term order so BSBI blocks use the same merge as SPIMI blocks
+        for term_id in sorted(groups, key=lambda t: self.terms[t]):
+            yield self.terms[term_id], groups[term_id]
+
+    def _clear(self):
+        self.triples = []
+
+
+def _read_block(path: str):
+    with open(path, 'r') as f:
+        for line in f:
+            term, data = line.rstrip('\n').split('\t', 1)
+            yield term, data
+
+
+def merge_blocks(block_files: list[str], writer):
+    """External k-way merge (heap over the block files). Only one term's postings are in memory at a time."""
+    streams = [_read_block(p) for p in block_files]
+    current_term = None
+    postings = {}
+    for term, data in heapq.merge(*streams, key=lambda x: x[0]):
+        if term != current_term:
+            if current_term is not None:
+                writer.add(current_term, postings)
+            current_term = term
+            postings = {}
+        for doc_id, positions in json.loads(data).items():
+            postings.setdefault(int(doc_id), []).extend(positions)
+    if current_term is not None:
+        writer.add(current_term, postings)
+    for path in block_files:
+        os.remove(path)
+
+
+def analyze_document(preprocessor, doc):
+    """Turns a document into (term, position) pairs plus its per-document data
+    [title_len, num_tokens, norm_title, norm_body, norm_all] (norms of the 1+log10(tf) vectors).
+    Positions run continuously through title then body, like a scan of the lowercased text."""
+    title_len = len(preprocessor.tokenize(doc.title))
+    title_tokens = preprocessor.process_with_positions(doc.title)
+    body_tokens = [(t, pos + title_len) for t, pos in preprocessor.process_with_positions(doc.body)]
+
+    def norm(counter):
+        return round(math.sqrt(sum((1 + math.log10(tf)) ** 2 for tf in counter.values())), 4)
+
+    title_tf = Counter(t for t, _ in title_tokens)
+    body_tf = Counter(t for t, _ in body_tokens)
+    meta = [title_len, len(title_tokens) + len(body_tokens),
+            norm(title_tf), norm(body_tf), norm(title_tf + body_tf)]
+    return title_tokens + body_tokens, meta

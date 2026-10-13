@@ -1,73 +1,118 @@
 import math
-import os
+import heapq
 from collections import defaultdict
-from src.parsing.preprocessor import TextPreprocessor
 from src.querying.index_reader import IndexReader
 
 class VectorSpaceModel:
-    def __init__(self, shards_dir: str = "index_data", num_shards: int = 4):
-        self.preprocessor = TextPreprocessor(use_stemming=True, remove_stopwords=True)
-        self.shards = []
-        universal_set = set()
-        
-        for i in range(num_shards):
-            shard_path = os.path.join(shards_dir, f"shard_{i}")
-            if os.path.exists(shard_path):
-                reader = IndexReader(shard_path)
-                self.shards.append(reader)
-                universal_set.update(reader.get_all_doc_ids())
-                
-        self.N = len(universal_set) if universal_set else 1 # Total corpus size for IDF
+    """Ranked free-text retrieval: cosine similarity of tf-idf vectors (lnc.ltc, IIR 6.4),
+    with weighted zone scoring (IIR 6.1):  score = g * cos(query, title) + (1 - g) * cos(query, body).
 
-    def get_term_stats(self, term: str) -> tuple[int, dict[int, int]]:
-        """Aggregates Document Frequency (df) and Term Frequencies (tf) across all shards."""
-        df = 0
-        tf_dict = defaultdict(int)
-        
-        for shard in self.shards:
-            if term in shard.dictionary:
-                meta = shard.dictionary[term]
-                df += meta["df"]
-                for doc_id_str, tf in meta["tf"].items():
-                    tf_dict[int(doc_id_str)] += tf
-                    
-        return df, dict(tf_dict)
+    Switches used for the baseline and the ablations:
+      use_idf=False          -> query weight is 1 + log tf (no idf)
+      use_length_norm=False  -> no cosine length normalization of documents
+      use_zones=False        -> title and body are treated as one field
+      raw_tf=True            -> raw term frequency instead of 1 + log tf (raw-tf baseline)
 
-    def search(self, query: str, top_k: int = 10) -> list[tuple[int, float]]:
-        """Scores documents against the query using tf-idf and cosine normalization."""
-        query_tokens = self.preprocessor.process(query)
-        if not query_tokens:
-            return []
-            
-        # 1. Calculate Query Term Frequencies
+    Only documents in the postings of the query terms are scored (term-at-a-time) and the top k is taken
+    with a heap. Two inexact top-k methods from IIR 7.1 can be used instead of exhaustive scoring:
+      method="index_elimination" -> ignore low-idf query terms and only score docs containing most query terms
+      method="champion"          -> only score docs in the champion lists (top r docs per term)"""
+    def __init__(self, index_dir: str = "index_data/ranked", title_weight: float = 0.1,
+                 use_idf: bool = True, use_length_norm: bool = True, use_zones: bool = True,
+                 raw_tf: bool = False, champion_r: int = 50, idf_threshold: float = 1.0):
+        self.reader = IndexReader(index_dir)
+        self.preprocessor = self.reader.preprocessor
+        self.N = self.reader.N
+        self.title_weight = title_weight
+        self.use_idf = use_idf
+        self.use_length_norm = use_length_norm
+        self.use_zones = use_zones
+        self.raw_tf = raw_tf
+        self.champion_r = champion_r
+        self.idf_threshold = idf_threshold
+        self.champion_lists = None
+        self.last_docs_scored = 0
+
+    def _tf_weight(self, tf: int) -> float:
+        if tf == 0:
+            return 0.0
+        return tf if self.raw_tf else 1 + math.log10(tf)
+
+    def doc_term_weight(self, doc_id: int, positions: list[int]) -> float:
+        """Weight of a term in a document (document side of lnc), combining the zones."""
+        title_len, _, norm_title, norm_body, norm_all = self.reader.docs[doc_id]
+        if not self.use_zones:
+            w = self._tf_weight(len(positions))
+            return w / norm_all if self.use_length_norm and norm_all > 0 else w
+        tf_title = sum(1 for p in positions if p < title_len)
+        w_title = self._tf_weight(tf_title)
+        w_body = self._tf_weight(len(positions) - tf_title)
+        if self.use_length_norm:
+            w_title = w_title / norm_title if norm_title > 0 else 0.0
+            w_body = w_body / norm_body if norm_body > 0 else 0.0
+        return self.title_weight * w_title + (1 - self.title_weight) * w_body
+
+    def idf(self, term: str) -> float:
+        df = self.reader.df(term)
+        return math.log10(self.N / df) if df else 0.0
+
+    def query_weights(self, query: str) -> dict[str, float]:
+        """Query side of ltc: (1 + log tf) * idf for every query term that is in the vocabulary."""
         query_tf = defaultdict(int)
-        for token in query_tokens:
+        for token in self.preprocessor.process(query):
             query_tf[token] += 1
-            
-        scores = defaultdict(float)
-        doc_lengths = defaultdict(float)
-        
-        # 2. Compute lnc.ltc weights
+        weights = {}
         for token, q_tf in query_tf.items():
-            df, doc_tfs = self.get_term_stats(token)
-            if df == 0:
+            if self.reader.df(token) == 0:
                 continue
-                
-            # Query Weight (ltc): Logarithmic tf * inverse document frequency
-            wt_q = (1 + math.log10(q_tf)) * math.log10(self.N / df)
-            
-            # Document Weight (lnc): Logarithmic tf * 1 (IDF is applied only to query to avoid double penalization)
-            for doc_id, tf in doc_tfs.items():
-                wt_d = 1 + math.log10(tf)
-                scores[doc_id] += wt_q * wt_d
-                doc_lengths[doc_id] += wt_d ** 2  # Accumulate squared weights for Cosine length
-                
-        # 3. Normalize Scores (Cosine Similarity)
-        results = []
-        for doc_id, dot_product in scores.items():
-            normalized_score = dot_product / math.sqrt(doc_lengths[doc_id])
-            results.append((doc_id, normalized_score))
-            
-        # 4. Sort and return Top K
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+            weights[token] = self._tf_weight(q_tf) * (self.idf(token) if self.use_idf else 1.0)
+        return weights
+
+    def build_champion_lists(self):
+        """For every term, the r documents with the highest weight for that term (computed once, IIR 7.1.3)."""
+        self.champion_lists = {}
+        for term in self.reader.vocabulary():
+            postings = self.reader.get_positions(term)
+            best = heapq.nlargest(self.champion_r, postings.items(),
+                                  key=lambda item: self.doc_term_weight(item[0], item[1]))
+            self.champion_lists[term] = {doc_id for doc_id, _ in best}
+        self.reader._cache.clear()
+
+    def search(self, query: str, top_k: int = 10, method: str = "exhaustive") -> list[tuple[int, float]]:
+        """Returns the top_k (doc_id, score) pairs, best first."""
+        weights = self.query_weights(query)
+        if not weights:
+            self.last_docs_scored = 0
+            return []
+
+        candidates = None  # None = every doc in the postings of the query terms
+        if method == "index_elimination":
+            # 1) drop low-idf terms (keep at least the rarest one)
+            kept = {t: w for t, w in weights.items() if self.idf(t) >= self.idf_threshold}
+            if not kept:
+                rarest = max(weights, key=self.idf)
+                kept = {rarest: weights[rarest]}
+            weights = kept
+            # 2) only docs that contain at least half of the remaining query terms
+            counts = defaultdict(int)
+            for term in weights:
+                for doc_id in self.reader.get_positions(term):
+                    counts[doc_id] += 1
+            needed = math.ceil(len(weights) / 2)
+            candidates = {d for d, c in counts.items() if c >= needed}
+        elif method == "champion":
+            if self.champion_lists is None:
+                self.build_champion_lists()
+            candidates = set()
+            for term in weights:
+                candidates |= self.champion_lists.get(term, set())
+
+        # Term-at-a-time accumulation
+        scores = defaultdict(float)
+        for term, w_q in weights.items():
+            for doc_id, positions in self.reader.get_positions(term).items():
+                if candidates is None or doc_id in candidates:
+                    scores[doc_id] += w_q * self.doc_term_weight(doc_id, positions)
+
+        self.last_docs_scored = len(scores)
+        return heapq.nlargest(top_k, scores.items(), key=lambda x: x[1])
