@@ -1,0 +1,106 @@
+{
+  "runs": [
+    {
+      "method": "SPIMI",
+      "memory_limit": 25000,
+      "blocks": 59,
+      "mb_written": 16.76,
+      "peak_mb": 5.5,
+      "time_s": 7.68
+    },
+    {
+      "method": "SPIMI",
+      "memory_limit": 50000,
+      "blocks": 30,
+      "mb_written": 16.24,
+      "peak_mb": 8.0,
+      "time_s": 6.6
+    },
+    {
+      "method": "SPIMI",
+      "memory_limit": 100000,
+      "blocks": 15,
+      "mb_written": 15.81,
+      "peak_mb": 12.5,
+      "time_s": 6.22
+    },
+    {
+      "method": "SPIMI",
+      "memory_limit": 200000,
+      "blocks": 8,
+      "mb_written": 15.49,
+      "peak_mb": 21.1,
+      "time_s": 6.2
+    },
+    {
+      "method": "SPIMI",
+      "memory_limit": 400000,
+      "blocks": 4,
+      "mb_written": 15.24,
+      "peak_mb": 37.4,
+      "time_s": 6.07
+    },
+    {
+      "method": "BSBI",
+      "memory_limit": 25000,
+      "blocks": 59,
+      "mb_written": 16.76,
+      "peak_mb": 10.7,
+      "time_s": 8.57
+    },
+    {
+      "method": "BSBI",
+      "memory_limit": 50000,
+      "blocks": 30,
+      "mb_written": 16.24,
+      "peak_mb": 15.0,
+      "time_s": 7.53
+    },
+    {
+      "method": "BSBI",
+      "memory_limit": 100000,
+      "blocks": 15,
+      "mb_written": 15.81,
+      "peak_mb": 22.9,
+      "time_s": 7.27
+    },
+    {
+      "method": "BSBI",
+      "memory_limit": 200000,
+      "blocks": 8,
+      "mb_written": 15.49,
+      "peak_mb": 38.6,
+      "time_s": 7.04
+    },
+    {
+      "method": "BSBI",
+      "memory_limit": 400000,
+      "blocks": 4,
+      "mb_written": 15.24,
+      "peak_mb": 68.8,
+      "time_s": 6.96
+    }
+  ],
+  "one_shard": {
+    "docs": 10788,
+    "blocks": 15,
+    "terms": 30952,
+    "bytes_written": 15810031,
+    "index_bytes": 4208102,
+    "peak_memory": 0,
+    "inversion_time": 3.576491117477417,
+    "worker_time": 3.541349411010742,
+    "total_time": 6.898996114730835
+  },
+  "four_shards": {
+    "docs": 10788,
+    "blocks": 16,
+    "terms": 30952,
+    "bytes_written": 15843742,
+    "index_bytes": 4208102,
+    "peak_memory": 0,
+    "inversion_time": 2.8691089153289795,
+    "worker_time": 1.244746446609497,
+    "total_time": 6.154202222824097
+  }
+}
