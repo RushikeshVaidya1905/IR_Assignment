@@ -1,38 +1,30 @@
-import os
-import json
+from src.querying.index_reader import IndexReader
 
 class SpellChecker:
-    def __init__(self, shards_dir: str = "index_data", num_shards: int = 4):
-        self.vocabulary = []
-        
-        for i in range(num_shards):
-            dict_path = os.path.join(shards_dir, f"shard_{i}", "dictionary.json")
-            if os.path.exists(dict_path):
-                with open(dict_path, 'r') as f:
-                    shard_dict = json.load(f)
-                    self.vocabulary.extend(shard_dict.keys())
-                    
-        self.vocabulary = list(set(self.vocabulary))
+    """Isolated-term correction (IIR 3.3): vocabulary terms within edit distance 2, closest first,
+    ties broken by document frequency (more common terms are more likely intended).
+    Uses the exact (unstemmed) index so suggestions are real words."""
+    def __init__(self, reader: IndexReader = None):
+        self.reader = reader or IndexReader("index_data/exact")
+        self.vocabulary = self.reader.vocabulary()
 
     def levenshtein_distance(self, s1: str, s2: str) -> int:
-        """Computes the minimum number of single-character edits required to change s1 into s2."""
-        if len(s1) < len(s2):
-            return self.levenshtein_distance(s2, s1)
-
-        if len(s2) == 0:
-            return len(s1)
-
-        previous_row = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
-            current_row = [i + 1]
-            for j, c2 in enumerate(s2):
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
-        
-        return previous_row[-1]
+        """Minimum number of single-character edits (insert, delete, substitute, or swap two adjacent
+        characters - Damerau's extension) required to change s1 into s2."""
+        d = [[0] * (len(s2) + 1) for _ in range(len(s1) + 1)]
+        for i in range(len(s1) + 1):
+            d[i][0] = i
+        for j in range(len(s2) + 1):
+            d[0][j] = j
+        for i in range(1, len(s1) + 1):
+            for j in range(1, len(s2) + 1):
+                cost = 0 if s1[i - 1] == s2[j - 1] else 1
+                d[i][j] = min(d[i - 1][j] + 1,         # deletion
+                              d[i][j - 1] + 1,         # insertion
+                              d[i - 1][j - 1] + cost)  # substitution
+                if i > 1 and j > 1 and s1[i - 1] == s2[j - 2] and s1[i - 2] == s2[j - 1]:
+                    d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)  # transposition
+        return d[len(s1)][len(s2)]
 
     def suggest(self, query_term: str, max_distance: int = 2) -> list[str]:
         """Returns vocabulary terms within a maximum edit distance."""
@@ -48,6 +40,6 @@ class SpellChecker:
             if dist <= max_distance:
                 suggestions.append((vocab_term, dist))
                 
-        # Sort by distance (ascending) then alphabetically
-        suggestions.sort(key=lambda x: (x[1], x[0]))
+        # Sort by distance (ascending), then by document frequency (descending), then alphabetically
+        suggestions.sort(key=lambda x: (x[1], -self.reader.df(x[0]), x[0]))
         return [term for term, dist in suggestions[:5]] # Return top 5 suggestions

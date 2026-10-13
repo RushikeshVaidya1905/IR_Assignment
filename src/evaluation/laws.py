@@ -1,33 +1,31 @@
 import os
-import json
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-from src.parsing.reuters_parser import ReutersParser
-from src.parsing.preprocessor import TextPreprocessor
+from src.parsing.corpus_parser import CorpusParser
+from src.querying.index_reader import IndexReader
+
+# Textbook values for Reuters-RCV1 (IIR 5.1): Heaps k = 44, b = 0.49; Zipf cf_i proportional to 1/i (exponent 1)
+RCV1_HEAPS_K, RCV1_HEAPS_B, RCV1_ZIPF_S = 44, 0.49, 1.0
 
 def heaps_model(T, k, b):
     """Mathematical model for Heap's Law: M = k * T^b"""
     return k * (T ** b)
 
 class LawFitter:
-    def __init__(self, shards_dir="index_data", raw_dir="data/raw"):
-        self.shards_dir = shards_dir
-        self.raw_dir = raw_dir
+    """Vocabulary laws on the exact index (case folding only, no stemming or stop word removal)."""
+    def __init__(self, index_dir="index_data/exact", out_dir="results"):
+        self.reader = IndexReader(index_dir)
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
 
     def plot_zipfs_law(self):
-        """Fits and plots Zipf's Law using the term frequencies across all index shards."""
+        """Fits and plots Zipf's Law using the collection frequency of every term in the index."""
+        # 1. Collection frequency (cf) of every term
         term_freqs = {}
-        
-        # 1. Aggregate frequencies from all shards
-        for i in range(4):
-            dict_path = os.path.join(self.shards_dir, f"shard_{i}", "dictionary.json")
-            if os.path.exists(dict_path):
-                with open(dict_path, 'r') as f:
-                    shard_dict = json.load(f)
-                    for term, meta in shard_dict.items():
-                        total_tf = sum(meta["tf"].values())
-                        term_freqs[term] = term_freqs.get(term, 0) + total_tf
+        for term in self.reader.vocabulary():
+            term_freqs[term] = sum(len(p) for p in self.reader.get_positions(term).values())
+        self.reader._cache.clear()
         
         if not term_freqs:
             print("Index is empty. Cannot plot Zipf's Law.")
@@ -51,19 +49,21 @@ class LawFitter:
         plt.loglog(ranks, freqs, marker=".", linestyle="none", label="Actual Document Data")
         plt.loglog(ranks, c / (ranks ** s), 'r-', label=f"Zipf's Fit (s={s:.3f}, c={c:.2f})")
         
-        plt.title("Zipf's Law on Reuters-21578")
+        plt.title("Zipf's Law on the Lexis corpus (Reuters-21578)")
         plt.xlabel("Rank (log scale)")
         plt.ylabel("Frequency (log scale)")
         plt.legend()
         plt.grid(True, which="both", ls="--", alpha=0.5)
         
-        plt.savefig("zipfs_law.png", dpi=300, bbox_inches='tight')
-        print(f"-> Zipf's Law saved to 'zipfs_law.png' (Calculated Exponent s = {s:.3f})")
+        plt.savefig(os.path.join(self.out_dir, "zipfs_law.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"-> Zipf's Law saved to '{self.out_dir}/zipfs_law.png' (Calculated Exponent s = {s:.3f}, RCV1: {RCV1_ZIPF_S})")
+        return {"zipf_s": s, "zipf_c": c, "rcv1_s": RCV1_ZIPF_S}
 
     def plot_heaps_law(self):
         """Streams documents to track vocabulary growth and fits Heap's Law."""
-        parser = ReutersParser(self.raw_dir)
-        preprocessor = TextPreprocessor(use_stemming=True, remove_stopwords=True)
+        parser = CorpusParser()
+        preprocessor = self.reader.preprocessor
         
         T_vals = [] # Total tokens
         M_vals = [] # Vocabulary size
@@ -100,11 +100,15 @@ class LawFitter:
         plt.plot(T_vals, M_vals, marker="o", linestyle="none", label="Actual Vocabulary Growth")
         plt.plot(T_vals, heaps_model(T_vals, k, b), 'r-', label=f"Heap's Fit (k={k:.2f}, b={b:.3f})")
         
-        plt.title("Heap's Law on Reuters-21578")
+        plt.title("Heap's Law on the Lexis corpus (Reuters-21578)")
         plt.xlabel("Total Tokens Processed (T)")
         plt.ylabel("Vocabulary Size (M)")
         plt.legend()
         plt.grid(True, ls="--", alpha=0.5)
         
-        plt.savefig("heaps_law.png", dpi=300, bbox_inches='tight')
-        print(f"-> Heap's Law saved to 'heaps_law.png' (Calculated k = {k:.2f}, b = {b:.3f})")
+        plt.savefig(os.path.join(self.out_dir, "heaps_law.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"-> Heap's Law saved to '{self.out_dir}/heaps_law.png' (Calculated k = {k:.2f}, b = {b:.3f}; "
+              f"RCV1: k = {RCV1_HEAPS_K}, b = {RCV1_HEAPS_B})")
+        return {"heaps_k": k, "heaps_b": b, "rcv1_k": RCV1_HEAPS_K, "rcv1_b": RCV1_HEAPS_B,
+                "tokens": int(total_tokens), "vocabulary": len(vocab)}
